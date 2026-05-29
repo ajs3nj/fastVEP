@@ -367,7 +367,15 @@ const TOPMED_FIELDS: &[(&str, &str)] = &[("ALL_AF", "allAf"), ("ALL_AC", "allAc"
 const MITOMAP_FIELDS: &[(&str, &str)] = &[("DISEASE", "disease"), ("STATUS", "status")];
 const SCORE_FIELDS: &[(&str, &str)] = &[("SCORE", "")];
 const SCORE_OBJECT_FIELDS: &[(&str, &str)] = &[("SCORE", "score")];
-const DBNSFP_FIELDS: &[(&str, &str)] = &[("SIFT", "sift"), ("POLYPHEN", "polyphen")];
+const DBNSFP_FIELDS: &[(&str, &str)] = &[
+    ("SIFT", "sift"),
+    ("POLYPHEN", "polyphen"),
+    ("ALPHAMISSENSE", "alphamissense"),
+    ("AM_CLASS", "am_class"),
+    ("ESM1B", "esm1b"),
+    ("ESM1B_CLASS", "esm1b_class"),
+    ("REVEL", "revel"),
+];
 const OMIM_FIELDS: &[(&str, &str)] = &[("MIM_NUMBER", "mimNumber"), ("PHENOTYPES", "phenotypes")];
 const GNOMAD_GENE_FIELDS: &[(&str, &str)] = &[
     ("PLI", "pLI"),
@@ -465,7 +473,7 @@ const VCF_PROJECTION_SPECS: &[VcfProjectionSpec] = &[
     VcfProjectionSpec {
         json_key: "dbnsfp",
         info_id: "FV_DBNSFP",
-        description: "fastVEP dbNSFP annotations. Format: ALLELE|SIFT|POLYPHEN",
+        description: "fastVEP dbNSFP annotations. Format: ALLELE|SIFT|POLYPHEN|ALPHAMISSENSE|AM_CLASS|ESM1B|ESM1B_CLASS|REVEL",
         fields: DBNSFP_FIELDS,
         kind: VcfProjectionKind::AlleleObject,
     },

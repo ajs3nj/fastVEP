@@ -81,7 +81,7 @@ pub fn parse_dbnsfp<R: BufRead>(
 
         // SIFT (first ;-split value, backward-compatible)
         if let Some(idx) = cols.sift_score {
-            if let Some((score, pred)) = first_score_pred(fields, idx, cols.sift_pred) {
+            if let Some((score, pred)) = first_score_pred(&fields, idx, cols.sift_pred) {
                 let pred_str = match pred.as_deref() {
                     Some("D") => "deleterious",
                     Some("T") => "tolerated",
@@ -97,7 +97,7 @@ pub fn parse_dbnsfp<R: BufRead>(
 
         // PolyPhen2 HDIV (first ;-split value, backward-compatible)
         if let Some(idx) = cols.polyphen_score {
-            if let Some((score, pred)) = first_score_pred(fields, idx, cols.polyphen_pred) {
+            if let Some((score, pred)) = first_score_pred(&fields, idx, cols.polyphen_pred) {
                 let pred_str = match pred.as_deref() {
                     Some("D") => "probably_damaging",
                     Some("P") => "possibly_damaging",
@@ -116,7 +116,7 @@ pub fn parse_dbnsfp<R: BufRead>(
         // dbNSFP AlphaMissense_pred letters: P=likely_pathogenic, A=ambiguous, B=likely_benign.
         if let Some(idx) = cols.alphamissense_score {
             if let Some((score, pred)) =
-                worst_score_pred(fields, idx, cols.alphamissense_pred, WorstDir::Max)
+                worst_score_pred(&fields, idx, cols.alphamissense_pred, WorstDir::Max)
             {
                 let class = match pred.as_deref() {
                     Some("P") => "likely_pathogenic",
@@ -135,7 +135,7 @@ pub fn parse_dbnsfp<R: BufRead>(
         // dbNSFP ESM1b_pred letters: D=damaging, T=tolerated.
         if let Some(idx) = cols.esm1b_score {
             if let Some((score, pred)) =
-                worst_score_pred(fields, idx, cols.esm1b_pred, WorstDir::Min)
+                worst_score_pred(&fields, idx, cols.esm1b_pred, WorstDir::Min)
             {
                 let class = match pred.as_deref() {
                     Some("D") => "damaging",
@@ -151,7 +151,7 @@ pub fn parse_dbnsfp<R: BufRead>(
 
         // REVEL -- single per-variant score; first ;-split value if multi-cardinality.
         if let Some(idx) = cols.revel_score {
-            if let Some((score, _)) = first_score_pred(fields, idx, None) {
+            if let Some((score, _)) = first_score_pred(&fields, idx, None) {
                 parts.push(format!("\"revel\":{:.4}", score));
             }
         }

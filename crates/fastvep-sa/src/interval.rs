@@ -132,7 +132,26 @@ impl IntervalIndex {
             .map_err(|_| anyhow::anyhow!("OSI payload size {} exceeds usize", len_u64))?;
         let mut data = vec![0u8; len];
         reader.read_exact(&mut data)?;
-        let index: IntervalIndex = bincode::deserialize(&data)?;
+        let mut index: IntervalIndex = bincode::deserialize(&data)?;
+        // `find_overlapping` relies on per-chromosome intervals being sorted
+        // by `start`. The writer enforces this via `sort()`, but a hand-
+        // crafted or partially-corrupted .osi could violate the invariant
+        // and produce silent missed overlaps. Sort on read as a safety net;
+        // this is O(n log n) once per open and negligible at query time.
+        let mut needed_sort = false;
+        for intervals in index.intervals.values_mut() {
+            if !intervals.windows(2).all(|w| w[0].start <= w[1].start) {
+                intervals.sort_by_key(|i| i.start);
+                needed_sort = true;
+            }
+        }
+        if needed_sort {
+            log::warn!(
+                "OSI '{}': intervals were not stored in sorted order; \
+                 sorted on load (writer should have called .sort())",
+                index.header.name
+            );
+        }
         Ok(index)
     }
 }
@@ -183,6 +202,37 @@ mod tests {
 
         assert_eq!(loaded.header.json_key, "dgv");
         assert_eq!(loaded.intervals["chr1"].len(), 2);
+    }
+
+    #[test]
+    fn test_read_sorts_unsorted_intervals() {
+        // Build an index with intervals deliberately out of order, serialize
+        // it (skipping the writer's `sort()`), then verify read_from puts
+        // them back in start-order so find_overlapping is correct.
+        let header = IntervalHeader {
+            schema_version: SCHEMA_VERSION,
+            json_key: "test".into(),
+            name: "Unsorted".into(),
+            version: "1.0".into(),
+            assembly: "GRCh38".into(),
+        };
+        let mut index = IntervalIndex::new(header);
+        // Intentionally out of order:
+        index.add(IntervalRecord { chrom: "chr1".into(), start: 500, end: 700, json: "{\"id\":\"B\"}".into() });
+        index.add(IntervalRecord { chrom: "chr1".into(), start: 100, end: 200, json: "{\"id\":\"A\"}".into() });
+        // Skip index.sort() so the on-disk layout is unsorted.
+
+        let mut buf = Vec::new();
+        index.write_to(&mut buf).unwrap();
+        let loaded = IntervalIndex::read_from(&mut std::io::Cursor::new(buf)).unwrap();
+
+        let intervals = &loaded.intervals["chr1"];
+        assert_eq!(intervals[0].start, 100);
+        assert_eq!(intervals[1].start, 500);
+
+        // And find_overlapping returns both when the query spans them.
+        let hits = loaded.find_overlapping("chr1", 50, 800);
+        assert_eq!(hits.len(), 2);
     }
 
     #[test]

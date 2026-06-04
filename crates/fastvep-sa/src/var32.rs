@@ -24,9 +24,16 @@ pub const CHUNK_BITS: u32 = 20;
 /// Maximum combined ref+alt bases that fit in a Var32.
 pub const MAX_COMBINED_LEN: usize = 4;
 
-/// DNA base to 2-bit encoding lookup (indexed by ASCII byte).
-const BASE_ENC: [u8; 128] = {
-    let mut table = [3u8; 128]; // default T
+/// DNA base to 2-bit encoding lookup (indexed by ASCII byte). A sentinel of
+/// 0xFF marks any byte that is not one of `{A,C,G,T,a,c,g,t}`; callers must
+/// reject those before reaching the encoder. Earlier revisions silently
+/// clamped non-ACGT bytes to 'T', which made variants containing `N` or
+/// IUPAC codes round-trip to a different sequence — a latent
+/// silent-mismatch bug — so the table now carries an explicit invalid
+/// marker.
+const INVALID_BASE: u8 = 0xFF;
+const BASE_ENC: [u8; 256] = {
+    let mut table = [INVALID_BASE; 256];
     table[b'A' as usize] = 0;
     table[b'a' as usize] = 0;
     table[b'C' as usize] = 1;
@@ -71,8 +78,14 @@ pub fn encode(pos: u32, ref_allele: &[u8], alt_allele: &[u8]) -> Option<u32> {
     let mut enc: u8 = 0;
     let mut bit_pos = 6; // Start from high bits of the 8-bit field
     for &b in ref_allele.iter().chain(alt_allele.iter()) {
-        let idx = (b as usize).min(127);
-        enc |= BASE_ENC[idx] << bit_pos;
+        let bits = BASE_ENC[b as usize];
+        if bits == INVALID_BASE {
+            // Non-ACGT base (N, IUPAC, lowercase non-DNA, etc.). Reject so the
+            // caller can normalise the allele upstream instead of getting a
+            // silently corrupted encoding that round-trips to something else.
+            return None;
+        }
+        enc |= bits << bit_pos;
         if bit_pos >= 2 {
             bit_pos -= 2;
         }
@@ -216,6 +229,21 @@ mod tests {
                 assert_eq!(da, a, "alt mismatch for rlen={} alen={}", rlen, alen);
             }
         }
+    }
+
+    #[test]
+    fn test_non_acgt_rejected() {
+        // N, IUPAC codes, and arbitrary high bytes must NOT silently encode
+        // as 'T' (the historic behaviour). Each should return None.
+        assert!(encode(0, b"N", b"A").is_none());
+        assert!(encode(0, b"A", b"N").is_none());
+        assert!(encode(0, b"R", b"Y").is_none()); // IUPAC
+        assert!(encode(0, b"a", b"x").is_none()); // arbitrary letter
+        assert!(encode(0, &[0u8], b"A").is_none()); // null byte
+        assert!(encode(0, &[0xC3, 0xA9], b"A").is_none()); // multi-byte UTF-8
+        // Valid ACGT (mixed case) still works.
+        assert!(encode(0, b"a", b"G").is_some());
+        assert!(encode(0, b"Ac", b"gT").is_some());
     }
 
     #[test]

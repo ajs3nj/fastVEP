@@ -4,6 +4,7 @@
 //! Var32 binary search on sorted genomic chunks.
 
 use crate::chunk::{delta_decode, Chunk};
+use crate::common::chrom_aliases;
 use crate::fields::{Field, FieldType};
 use crate::kmer16::LongVariant;
 use crate::var32;
@@ -11,6 +12,7 @@ use crate::writer_v2::{read_u32_array, Osa2Metadata};
 use anyhow::{Context, Result};
 use lru::LruCache;
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -40,7 +42,13 @@ pub struct Osa2Reader {
     fields: Vec<Field>,
     /// Categorical string lookup tables per field.
     string_tables: Vec<Vec<String>>,
-    /// LRU cache of loaded chunks, keyed by "chrom/chunk_id".
+    /// Chromosome names present on-disk under `fastsa/<chrom>/...`.
+    /// Used by `resolve_chrom` to canonicalize a query name (e.g. `chr1`
+    /// → `1`) before any cache key is built, so a workload that mixes
+    /// `chr*` and bare styles for the same physical contig never warms
+    /// two cache slots for the same chunk. See issue #37.
+    on_disk_chroms: HashSet<String>,
+    /// LRU cache of loaded chunks, keyed by `"<canonical-chrom>/<chunk_id>"`.
     chunk_cache: Mutex<LruCache<String, Arc<Chunk>>>,
 }
 
@@ -104,6 +112,28 @@ impl Osa2Reader {
             is_positional: metadata.is_positional,
         };
 
+        // Enumerate chromosome directories once so `resolve_chrom` can
+        // pick the on-disk canonical name without re-scanning the ZIP per
+        // query. Entries look like `fastsa/<chrom>/<chunk_id>/var32.bin`,
+        // so we collect the second path segment under `fastsa/`.
+        let mut on_disk_chroms = HashSet::new();
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i)?;
+            let name = entry.name();
+            let Some(rest) = name.strip_prefix("fastsa/") else {
+                continue;
+            };
+            let Some((chrom, _)) = rest.split_once('/') else {
+                continue;
+            };
+            // Skip the sibling metadata/config/strings subtrees, which
+            // share the `fastsa/` parent but aren't chromosome shards.
+            if matches!(chrom, "metadata.json" | "config.json" | "strings") {
+                continue;
+            }
+            on_disk_chroms.insert(chrom.to_string());
+        }
+
         let cache_size = NonZeroUsize::new(CHUNK_CACHE_SIZE)
             .expect("CHUNK_CACHE_SIZE is a non-zero compile-time constant");
 
@@ -113,46 +143,91 @@ impl Osa2Reader {
             sa_metadata,
             fields,
             string_tables,
+            on_disk_chroms,
             chunk_cache: Mutex::new(LruCache::new(cache_size)),
         })
+    }
+
+    /// Resolve a query chromosome name (e.g. `chr1`, `1`, `chrM`, `MT`)
+    /// to the canonical on-disk name actually present in the archive.
+    /// Returns the input unchanged when no alias is present — callers
+    /// then naturally produce empty results.
+    fn resolve_chrom<'a>(&self, chrom: &'a str) -> String {
+        if self.on_disk_chroms.contains(chrom) {
+            return chrom.to_string();
+        }
+        chrom_aliases(chrom)
+            .into_iter()
+            .find(|alias| self.on_disk_chroms.contains(alias))
+            .unwrap_or_else(|| chrom.to_string())
     }
 
     /// Build a chunk by reading its files from the ZIP archive. Pure (no cache
     /// access), so it can run with the cache mutex unheld and avoid blocking
     /// other readers during disk I/O.
+    ///
+    /// Each sub-entry is treated as follows:
+    ///   * absent from the archive (`ZipError::FileNotFound`) — legitimate
+    ///     "this chunk has no data for this field", continue with the empty
+    ///     case;
+    ///   * any other archive error — propagate, since this means the .osa2 is
+    ///     corrupt or unreadable.
+    /// Earlier revisions collapsed both cases together via `Err(_) => …`,
+    /// which silently turned data corruption into false-negative lookups.
     fn build_chunk(&self, chrom: &str, chunk_id: u32) -> Result<Chunk> {
         let file = File::open(&self.zip_path)?;
         let mut archive = zip::ZipArchive::new(file)?;
+        // `chrom` is expected to be canonical (resolved by `resolve_chrom`
+        // at the public entry points), so no alias walk is needed here.
         let prefix = format!("fastsa/{}/{}/", chrom, chunk_id);
 
-        // Read var32 keys
-        let var32s = {
-            let name = format!("{}var32.bin", prefix);
-            match archive.by_name(&name) {
-                Ok(mut entry) => {
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf)?;
-                    let mut keys = read_u32_array(&buf)?;
-                    delta_decode(&mut keys); // Reconstruct from deltas
-                    keys
-                }
-                Err(_) => {
-                    // Chunk doesn't exist in this archive
-                    return Ok(Chunk::empty());
-                }
+        // Read var32 keys. If absent, this chunk has no short variants at all,
+        // which also implies no long variants and no parallel value arrays —
+        // short-circuit to an empty chunk.
+        let var32s = match archive.by_name(&format!("{}var32.bin", prefix)) {
+            Ok(mut entry) => {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                let mut keys = read_u32_array(&buf)?;
+                delta_decode(&mut keys);
+                keys
+            }
+            Err(zip::result::ZipError::FileNotFound) => return Ok(Chunk::empty()),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read var32 entry for chunk {}/{}: {}",
+                    chrom,
+                    chunk_id,
+                    e
+                ));
             }
         };
 
-        // Read long variants
-        let longs: Vec<LongVariant> = {
-            let name = format!("{}too-long.enc", prefix);
-            match archive.by_name(&name) {
-                Ok(mut entry) => {
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf)?;
-                    bincode::deserialize(&buf).unwrap_or_default()
-                }
-                Err(_) => Vec::new(),
+        // Read long variants.
+        let longs: Vec<LongVariant> = match archive.by_name(&format!("{}too-long.enc", prefix)) {
+            Ok(mut entry) => {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                // Propagate bincode errors so a corrupt `too-long.enc` is
+                // reported instead of silently masquerading as "no long
+                // variants in this chunk".
+                bincode::deserialize(&buf).map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to deserialize long-variant block for chunk {}/{}: {}",
+                        chrom,
+                        chunk_id,
+                        e
+                    )
+                })?
+            }
+            Err(zip::result::ZipError::FileNotFound) => Vec::new(),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read long-variant entry for chunk {}/{}: {}",
+                    chrom,
+                    chunk_id,
+                    e
+                ));
             }
         };
 
@@ -169,35 +244,48 @@ impl Osa2Reader {
                     entry.read_to_end(&mut buf)?;
                     values.push(read_u32_array(&buf)?);
                 }
-                Err(_) => {
-                    // Fill with missing values
+                Err(zip::result::ZipError::FileNotFound) => {
                     values.push(vec![field.missing_value; var32s.len()]);
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to read value column '{}' for chunk {}/{}: {}",
+                        field.alias,
+                        chrom,
+                        chunk_id,
+                        e
+                    ));
                 }
             }
         }
 
         // Read JSON blobs if any
-        let json_blobs = {
-            let name = format!("{}json_blobs.zst", prefix);
-            match archive.by_name(&name) {
-                Ok(mut entry) => {
-                    let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf)?;
-                    // Bound the decompressed size to defend against zstd bombs.
-                    let mut decoder = zstd::stream::Decoder::new(buf.as_slice())?;
-                    let mut decompressed = Vec::new();
-                    let mut limited = (&mut decoder).take(MAX_JSON_BLOB_DECOMPRESSED as u64 + 1);
-                    limited.read_to_end(&mut decompressed)?;
-                    if decompressed.len() > MAX_JSON_BLOB_DECOMPRESSED {
-                        anyhow::bail!(
-                            "JSON blob decompressed size exceeds limit ({} bytes)",
-                            MAX_JSON_BLOB_DECOMPRESSED
-                        );
-                    }
-                    let text = String::from_utf8(decompressed)?;
-                    Some(text.lines().map(|l| l.to_string()).collect())
+        let json_blobs = match archive.by_name(&format!("{}json_blobs.zst", prefix)) {
+            Ok(mut entry) => {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                // Bound the decompressed size to defend against zstd bombs.
+                let mut decoder = zstd::stream::Decoder::new(buf.as_slice())?;
+                let mut decompressed = Vec::new();
+                let mut limited = (&mut decoder).take(MAX_JSON_BLOB_DECOMPRESSED as u64 + 1);
+                limited.read_to_end(&mut decompressed)?;
+                if decompressed.len() > MAX_JSON_BLOB_DECOMPRESSED {
+                    anyhow::bail!(
+                        "JSON blob decompressed size exceeds limit ({} bytes)",
+                        MAX_JSON_BLOB_DECOMPRESSED
+                    );
                 }
-                Err(_) => None,
+                let text = String::from_utf8(decompressed)?;
+                Some(text.lines().map(|l| l.to_string()).collect())
+            }
+            Err(zip::result::ZipError::FileNotFound) => None,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to read json_blobs for chunk {}/{}: {}",
+                    chrom,
+                    chunk_id,
+                    e
+                ));
             }
         };
 
@@ -232,11 +320,14 @@ impl Osa2Reader {
 
     /// Query a variant in the loaded chunks.
     fn query(&self, chrom: &str, pos: u32, ref_allele: &[u8], alt_allele: &[u8]) -> Result<Option<String>> {
+        // Canonicalize before constructing the cache key so `chr1` and `1`
+        // (same physical chunk) share a single LRU slot.
+        let chrom = self.resolve_chrom(chrom);
         let chunk_id = pos >> self.metadata.chunk_bits;
         let cache_key = format!("{}/{}", chrom, chunk_id);
 
         // Ensure chunk is loaded
-        self.load_chunk(chrom, chunk_id)?;
+        self.load_chunk(&chrom, chunk_id)?;
 
         // `LruCache::get` mutates recency order, so lock only for lookup and
         // clone an `Arc` to release the mutex before search/reconstruction.
@@ -274,6 +365,12 @@ impl Osa2Reader {
                 // the value columns and JSON-blob array. Without this guard
                 // `reconstruct_json` would silently return `{}` and the caller
                 // would treat it as a positive match.
+                //
+                // We take the *max* across the column lengths and the
+                // json_blobs length (the writer keeps them parallel to the
+                // sorted record order). A truly corrupt chunk with a value
+                // column shorter than the others is caught by the per-column
+                // `column.get(idx)` guard inside `reconstruct_json`.
                 let data_len = chunk
                     .values
                     .iter()
@@ -335,6 +432,11 @@ impl AnnotationProvider for Osa2Reader {
             return Ok(());
         }
 
+        // Canonicalize once so the chunks preloaded here share cache keys
+        // with the subsequent `annotate_position` calls that follow,
+        // regardless of which naming style each side uses.
+        let chrom = self.resolve_chrom(chrom);
+
         // Determine which chunks need to be loaded. Reject positions that
         // overflow u32 rather than silently truncating into the wrong chunk.
         let mut chunk_ids: Vec<u32> = Vec::with_capacity(positions.len());
@@ -348,7 +450,7 @@ impl AnnotationProvider for Osa2Reader {
         chunk_ids.dedup();
 
         for cid in chunk_ids {
-            self.load_chunk(chrom, cid)?;
+            self.load_chunk(&chrom, cid)?;
         }
 
         Ok(())

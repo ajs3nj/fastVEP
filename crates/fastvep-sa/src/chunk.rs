@@ -45,11 +45,16 @@ impl Chunk {
     }
 
     /// Look up a long variant. Returns the index into value arrays.
+    ///
+    /// Returns `None` if either allele contains a non-ACGT base: such a
+    /// variant could not have been written into the index without being
+    /// silently corrupted, so we report a miss rather than guessing.
     pub fn find_long(&self, position: u32, ref_allele: &[u8], alt_allele: &[u8]) -> Option<usize> {
+        let sequence = crate::kmer16::encode_var(ref_allele, alt_allele)?;
         let query = LongVariant {
             position,
             idx: 0,
-            sequence: crate::kmer16::encode_var(ref_allele, alt_allele),
+            sequence,
         };
         self.longs.binary_search(&query).ok().map(|i| self.longs[i].idx as usize)
     }

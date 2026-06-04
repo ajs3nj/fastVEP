@@ -753,7 +753,9 @@ pub fn format_vcf_info_fields(original_info: &str, vf: &VariationFeature, csq: &
 }
 
 fn format_spliceai_projection(vf: &VariationFeature) -> Option<String> {
+    // O(n) order-preserving dedup (was O(n^2) via `Vec::contains`).
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tv in &vf.transcript_variations {
         for aa in &tv.allele_annotations {
             let Some(joined) = format_spliceai_for_allele(vf, aa) else {
@@ -763,8 +765,12 @@ fn format_spliceai_projection(vf: &VariationFeature) -> Option<String> {
             // allele; split them back out so variant-level dedupe stays
             // entry-by-entry rather than across whole allele payloads.
             for value in joined.split(',') {
+                // Allocate the owned String once; clone it into the HashSet
+                // and only retain it in `values` on first-seen. Earlier code
+                // called `value.to_string()` twice per unique entry, doubling
+                // allocations in this hot path.
                 let owned = value.to_string();
-                if !values.contains(&owned) {
+                if seen.insert(owned.clone()) {
                     values.push(owned);
                 }
             }
@@ -810,15 +816,21 @@ fn escape_spliceai_field(value: &str) -> String {
 }
 
 fn format_allele_projection(vf: &VariationFeature, spec: &VcfProjectionSpec) -> Option<String> {
+    // Preserve first-seen order while deduplicating in O(n) instead of the
+    // earlier O(n^2) `Vec::contains` scan. A variant overlapping many
+    // transcripts with the same SA payload can otherwise quadruple-walk
+    // every projection string in a hot loop.
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tv in &vf.transcript_variations {
         for aa in &tv.allele_annotations {
             let Some(joined) = format_allele_projection_for_aa(vf, aa, spec) else {
                 continue;
             };
             for value in joined.split(',') {
+                // Single allocation per unique value (see `format_spliceai_projection`).
                 let owned = value.to_string();
-                if !values.contains(&owned) {
+                if seen.insert(owned.clone()) {
                     values.push(owned);
                 }
             }
@@ -842,6 +854,7 @@ fn iter_gene_objects(parsed: &Value) -> Vec<&Value> {
 
 fn format_gene_projection(vf: &VariationFeature, spec: &VcfProjectionSpec) -> Option<String> {
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ga in &vf.gene_annotations {
         if ga.json_key != spec.json_key {
             continue;
@@ -858,7 +871,7 @@ fn format_gene_projection(vf: &VariationFeature, spec: &VcfProjectionSpec) -> Op
                 }
             }
             let value = parts.join("|");
-            if !values.contains(&value) {
+            if seen.insert(value.clone()) {
                 values.push(value);
             }
         }
@@ -869,12 +882,13 @@ fn format_gene_projection(vf: &VariationFeature, spec: &VcfProjectionSpec) -> Op
 fn format_spliceai_for_allele(vf: &VariationFeature, aa: &AlleleAnnotation) -> Option<String> {
     let allele = uploaded_allele_for_annotation(vf, &aa.allele);
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, json_str) in &aa.supplementary {
         if key != "spliceAI" {
             continue;
         }
         if let Some(value) = format_spliceai_entry(&allele, json_str) {
-            if !values.contains(&value) {
+            if seen.insert(value.clone()) {
                 values.push(value);
             }
         }
@@ -889,12 +903,28 @@ fn format_allele_projection_for_aa(
 ) -> Option<String> {
     let allele = uploaded_allele_for_annotation(vf, &aa.allele);
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, json_str) in &aa.supplementary {
         if key != spec.json_key {
             continue;
         }
-        let parsed = serde_json::from_str::<Value>(json_str)
-            .unwrap_or_else(|_| Value::String(json_str.clone()));
+        // Truncated or otherwise non-JSON supplementary payloads used to fall
+        // back to `Value::String(json_str.clone())` here, which silently
+        // pushed the raw blob into the projection. Now we log at debug level
+        // and skip this entry — callers see a missing column instead of a
+        // mis-shaped one.
+        let parsed = match serde_json::from_str::<Value>(json_str) {
+            Ok(v) => v,
+            Err(e) => {
+                log::debug!(
+                    "Skipping non-JSON supplementary payload for key='{}': {} (payload snippet: {})",
+                    spec.json_key,
+                    e,
+                    &json_str.chars().take(80).collect::<String>(),
+                );
+                continue;
+            }
+        };
         let entries = match spec.kind {
             VcfProjectionKind::AlleleScalar => {
                 vec![format!("{}|{}", escape_vcf_subfield(&allele), json_value_to_vcf(&parsed))]
@@ -902,7 +932,7 @@ fn format_allele_projection_for_aa(
             _ => format_object_projection_entries(&allele, &parsed, spec.fields),
         };
         for value in entries {
-            if !values.contains(&value) {
+            if seen.insert(value.clone()) {
                 values.push(value);
             }
         }
@@ -921,6 +951,7 @@ fn format_gene_projection_for_tv(
     // uses — so tab rows for transcripts with no symbol don't lose data.
     let symbol_filter = tv.gene_symbol.as_deref();
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ga in &vf.gene_annotations {
         if ga.json_key != spec.json_key {
             continue;
@@ -942,7 +973,7 @@ fn format_gene_projection_for_tv(
                 }
             }
             let value = parts.join("|");
-            if !values.contains(&value) {
+            if seen.insert(value.clone()) {
                 values.push(value);
             }
         }
@@ -959,6 +990,7 @@ fn format_clinvar_protein_projection_for_tv(
     // dedupe when the transcript has no associated gene symbol.
     let symbol_filter = tv.gene_symbol.as_deref();
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ga in &vf.gene_annotations {
         if ga.json_key != spec.json_key {
             continue;
@@ -976,7 +1008,7 @@ fn format_clinvar_protein_projection_for_tv(
             continue;
         }
         let value = format!("{}|{}", escape_vcf_subfield(&ga.gene_symbol), variants);
-        if !values.contains(&value) {
+        if seen.insert(value.clone()) {
             values.push(value);
         }
     }
@@ -1008,6 +1040,7 @@ fn format_clinvar_protein_projection(
     spec: &VcfProjectionSpec,
 ) -> Option<String> {
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ga in &vf.gene_annotations {
         if ga.json_key != spec.json_key {
             continue;
@@ -1020,7 +1053,7 @@ fn format_clinvar_protein_projection(
             continue;
         }
         let value = format!("{}|{}", escape_vcf_subfield(&ga.gene_symbol), variants);
-        if !values.contains(&value) {
+        if seen.insert(value.clone()) {
             values.push(value);
         }
     }
@@ -1115,7 +1148,25 @@ fn uploaded_allele_for_annotation(vf: &VariationFeature, allele: &Allele) -> Str
         .to_string()
 }
 
-/// Format a VariationFeature as a tab-delimited VEP output line.
+/// Optional knobs that extend the base tab schema. All fields are
+/// no-op by default so the hot path is unchanged unless a caller opts in.
+#[derive(Default, Clone, Copy)]
+pub struct TabOptions<'a> {
+    /// Drop rows whose transcript's gene_id / gene_symbol is not in this
+    /// set. Variant-level rows (intergenic) are dropped entirely; in
+    /// `sa_only` mode the filter is ignored because there is no transcript
+    /// context.
+    pub gene_set: Option<&'a crate::geneset::GeneSet>,
+    /// Insert an explicit `REF` column right after `Allele`.
+    pub explicit_ref: bool,
+    /// Append a `QC_CLASS` column carrying the supplied class name. When
+    /// `None`, the column is omitted.
+    pub qc_class: Option<&'a str>,
+}
+
+/// Format a VariationFeature as a tab-delimited VEP output line using the
+/// default schema. Equivalent to `format_tab_line_with(vf, specs, sa_only,
+/// TabOptions::default())`.
 ///
 /// `specs` enumerates which supplementary annotation sources are loaded for
 /// this run (build once via `LoadedSupplementarySpecs::new`). For each
@@ -1129,6 +1180,16 @@ pub fn format_tab_line(
     vf: &VariationFeature,
     specs: &LoadedSupplementarySpecs,
     sa_only: bool,
+) -> Vec<String> {
+    format_tab_line_with(vf, specs, sa_only, TabOptions::default())
+}
+
+/// Tab formatter with optional schema extensions. See [`TabOptions`].
+pub fn format_tab_line_with(
+    vf: &VariationFeature,
+    specs: &LoadedSupplementarySpecs,
+    sa_only: bool,
+    opts: TabOptions<'_>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -1147,16 +1208,30 @@ pub fn format_tab_line(
         .unwrap_or_else(|| format!("{}_{}", location, vf.allele_string));
 
     let extra_count = specs.column_count();
+    let ref_str: Option<String> = if opts.explicit_ref {
+        Some(vf.ref_allele.to_string())
+    } else {
+        None
+    };
+    let qc_extra = if opts.qc_class.is_some() { 1 } else { 0 };
+    let ref_extra = if opts.explicit_ref { 1 } else { 0 };
 
     if sa_only {
         for tv in &vf.transcript_variations {
             for aa in &tv.allele_annotations {
-                let mut parts: Vec<String> = Vec::with_capacity(3 + extra_count);
+                let mut parts: Vec<String> =
+                    Vec::with_capacity(3 + ref_extra + extra_count + qc_extra);
                 parts.push(uploaded_variation.clone());
                 parts.push(location.clone());
                 parts.push(aa.allele.to_string());
+                if let Some(ref r) = ref_str {
+                    parts.push(r.clone());
+                }
                 if extra_count > 0 {
                     parts.extend(format_supplementary_tab_columns_for_allele(vf, tv, aa, specs));
+                }
+                if let Some(cls) = opts.qc_class {
+                    parts.push(cls.to_string());
                 }
                 lines.push(parts.join("\t"));
             }
@@ -1167,12 +1242,19 @@ pub fn format_tab_line(
         // header.
         if lines.is_empty() {
             for alt in &vf.alt_alleles {
-                let mut parts: Vec<String> = Vec::with_capacity(3 + extra_count);
+                let mut parts: Vec<String> =
+                    Vec::with_capacity(3 + ref_extra + extra_count + qc_extra);
                 parts.push(uploaded_variation.clone());
                 parts.push(location.clone());
                 parts.push(alt.to_string());
+                if let Some(ref r) = ref_str {
+                    parts.push(r.clone());
+                }
                 if extra_count > 0 {
                     parts.extend(vec!["-".to_string(); extra_count]);
+                }
+                if let Some(cls) = opts.qc_class {
+                    parts.push(cls.to_string());
                 }
                 lines.push(parts.join("\t"));
             }
@@ -1180,9 +1262,14 @@ pub fn format_tab_line(
         return lines;
     }
 
-    let row_capacity = 17 + extra_count;
+    let row_capacity = 17 + ref_extra + extra_count + qc_extra;
 
     for tv in &vf.transcript_variations {
+        if let Some(set) = opts.gene_set {
+            if !set.contains_gene(&tv.gene_id, tv.gene_symbol.as_deref()) {
+                continue;
+            }
+        }
         for aa in &tv.allele_annotations {
             let consequence_str = aa
                 .consequences
@@ -1200,6 +1287,9 @@ pub fn format_tab_line(
             parts.push(uploaded_variation.clone());
             parts.push(location.clone());
             parts.push(aa.allele.to_string());
+            if let Some(ref r) = ref_str {
+                parts.push(r.clone());
+            }
             parts.push(tv.gene_id.to_string());
             parts.push(tv.transcript_id.to_string());
             parts.push("Transcript".to_string());
@@ -1233,24 +1323,34 @@ pub fn format_tab_line(
                 parts.extend(format_supplementary_tab_columns_for_allele(vf, tv, aa, specs));
             }
 
+            if let Some(cls) = opts.qc_class {
+                parts.push(cls.to_string());
+            }
+
             lines.push(parts.join("\t"));
         }
     }
 
-    // If no transcript annotations, still output the variant with intergenic.
-    // Pad the row to the full 17 + extra column shape so all tab rows share
-    // a header — even when only intergenic alleles are present.
-    if vf.transcript_variations.is_empty() {
+    // If no transcript annotations, still output the variant with intergenic
+    // — unless a gene-set filter is active, in which case an unannotated
+    // variant has nothing to match and is dropped.
+    if vf.transcript_variations.is_empty() && opts.gene_set.is_none() {
         for alt in &vf.alt_alleles {
             let mut parts: Vec<String> = Vec::with_capacity(row_capacity);
             parts.push(uploaded_variation.clone());
             parts.push(location.clone());
             parts.push(alt.to_string());
+            if let Some(ref r) = ref_str {
+                parts.push(r.clone());
+            }
             parts.extend(vec!["-".to_string(); 3]);
             parts.push(Consequence::IntergenicVariant.so_term().to_string());
             parts.extend(vec!["-".to_string(); 10]);
             if extra_count > 0 {
                 parts.extend(vec!["-".to_string(); extra_count]);
+            }
+            if let Some(cls) = opts.qc_class {
+                parts.push(cls.to_string());
             }
             lines.push(parts.join("\t"));
         }
@@ -2208,5 +2308,87 @@ mod tests {
             "{info}"
         );
         assert!(!info.contains("SpliceAI=-|"), "{info}");
+    }
+
+    #[test]
+    fn tab_options_explicit_ref_adds_ref_column() {
+        let vf = projection_test_variant();
+        let specs = LoadedSupplementarySpecs::new(&[], &[]);
+        let opts = TabOptions {
+            explicit_ref: true,
+            ..TabOptions::default()
+        };
+        let lines = format_tab_line_with(&vf, &specs, false, opts);
+        assert_eq!(lines.len(), 1);
+        let cols: Vec<&str> = lines[0].split('\t').collect();
+        // Base 17 columns + 1 REF column inserted after Allele (index 2).
+        assert_eq!(cols.len(), 18, "expected 18 cols, got: {:?}", cols);
+        assert_eq!(cols[2], "G", "Allele column should still hold ALT");
+        assert_eq!(cols[3], "A", "REF column should follow Allele");
+    }
+
+    #[test]
+    fn tab_options_qc_class_adds_trailing_column() {
+        let vf = projection_test_variant();
+        let specs = LoadedSupplementarySpecs::new(&[], &[]);
+        let opts = TabOptions {
+            qc_class: Some("HIGH_QC"),
+            ..TabOptions::default()
+        };
+        let lines = format_tab_line_with(&vf, &specs, false, opts);
+        let cols: Vec<&str> = lines[0].split('\t').collect();
+        assert_eq!(cols.len(), 18);
+        assert_eq!(cols.last().copied(), Some("HIGH_QC"));
+    }
+
+    #[test]
+    fn tab_options_gene_set_drops_non_matching_transcripts() {
+        let vf = projection_test_variant();
+        let specs = LoadedSupplementarySpecs::new(&[], &[]);
+
+        let included = crate::geneset::GeneSet::from_iter(["GENE1"]);
+        let opts_match = TabOptions {
+            gene_set: Some(&included),
+            ..TabOptions::default()
+        };
+        let lines = format_tab_line_with(&vf, &specs, false, opts_match);
+        assert_eq!(lines.len(), 1, "GENE1 in panel → row kept");
+
+        let excluded = crate::geneset::GeneSet::from_iter(["OTHER"]);
+        let opts_no_match = TabOptions {
+            gene_set: Some(&excluded),
+            ..TabOptions::default()
+        };
+        let lines = format_tab_line_with(&vf, &specs, false, opts_no_match);
+        assert!(lines.is_empty(), "GENE1 not in panel → row dropped");
+    }
+
+    #[test]
+    fn tab_options_combined_ref_and_qc_class_preserve_order() {
+        let vf = projection_test_variant();
+        let specs = LoadedSupplementarySpecs::new(&[], &[]);
+        let opts = TabOptions {
+            explicit_ref: true,
+            qc_class: Some("HIGH_QC"),
+            ..TabOptions::default()
+        };
+        let lines = format_tab_line_with(&vf, &specs, false, opts);
+        let cols: Vec<&str> = lines[0].split('\t').collect();
+        // Base 17 + REF + QC = 19. REF at index 3, QC last.
+        assert_eq!(cols.len(), 19);
+        assert_eq!(cols[3], "A");
+        assert_eq!(cols.last().copied(), Some("HIGH_QC"));
+    }
+
+    #[test]
+    fn tab_line_default_unchanged_when_options_empty() {
+        // Regression guard: the no-option call path must match the original
+        // 17-column shape exactly.
+        let vf = projection_test_variant();
+        let specs = LoadedSupplementarySpecs::new(&[], &[]);
+        let baseline = format_tab_line(&vf, &specs, false);
+        let with_default = format_tab_line_with(&vf, &specs, false, TabOptions::default());
+        assert_eq!(baseline, with_default);
+        assert_eq!(baseline[0].split('\t').count(), 17);
     }
 }

@@ -25,7 +25,20 @@ impl FastaReader {
                 if let Some(name) = current_name.take() {
                     sequences.insert(name, std::mem::take(&mut current_seq));
                 }
-                let name = line[1..].split_whitespace().next().unwrap_or("").to_string();
+                // The FASTA spec requires a non-empty identifier after `>`.
+                // An empty header would silently produce an unnamed sequence
+                // that downstream lookups can never match; surface it
+                // explicitly so the caller knows the file is malformed.
+                let name = line[1..]
+                    .split_whitespace()
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "FASTA contains a `>` line with no sequence identifier"
+                        )
+                    })?;
                 current_name = Some(name);
                 current_seq.clear();
             } else if !line.is_empty() {

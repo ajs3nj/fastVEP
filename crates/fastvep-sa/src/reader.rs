@@ -6,7 +6,7 @@
 //! same block.
 
 use crate::block::{BlockEntry, SaBlock};
-use crate::common::OSA_MAGIC;
+use crate::common::{chrom_aliases, OSA_MAGIC};
 use crate::index::{BlockRef, SaIndex};
 use anyhow::Result;
 use fastvep_cache::annotation::{AnnotationProvider, AnnotationValue, SaMetadata};
@@ -191,11 +191,13 @@ impl SaReader {
         // disagree the `.osa` and `.osa.idx` are out of sync (corrupt or
         // mismatched files) and we'd otherwise silently decompress the wrong
         // byte range.
-        let on_disk_len = u32::from_le_bytes(
-            self.mmap[offset..offset + 4]
-                .try_into()
-                .expect("4-byte slice"),
-        );
+        // Bounds were just verified, but never `.expect()` on parsed bytes:
+        // surface any unexpected slice shape as a typed error so debugging a
+        // mismatched .osa/.osa.idx pair never produces a panic.
+        let len_bytes: [u8; 4] = self.mmap[offset..offset + 4]
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("expected 4-byte block length prefix at offset {}", offset))?;
+        let on_disk_len = u32::from_le_bytes(len_bytes);
         if on_disk_len != compressed_len {
             anyhow::bail!(
                 "Block length mismatch at offset {}: index says {} bytes, data file prefix says {}",
@@ -323,9 +325,29 @@ impl AnnotationProvider for SaReader {
             return Ok(());
         }
 
-        let blocks = match self.index.chromosomes.get(chrom) {
-            Some(b) => b.as_slice(),
-            None => return Ok(()),
+        // Honor the same chr*/bare/mitochondrial aliases as `find_blocks`
+        // so a preload on `chr1` against an index built with `1` (or vice
+        // versa) still primes the cache instead of silently no-op'ing.
+        let blocks = chrom_aliases(chrom)
+            .iter()
+            .find_map(|alias| self.index.chromosomes.get(alias))
+            .map(|v| v.as_slice());
+        let blocks = match blocks {
+            Some(b) => b,
+            None => {
+                // A chromosome the caller asked about that is not in the
+                // index isn't necessarily an error (e.g., chrM absent from
+                // ClinVar), but a typo would otherwise produce silently
+                // empty annotations forever. Surface it at debug level so
+                // operators can grep their logs without drowning in noise
+                // on normal runs.
+                log::debug!(
+                    "SA preload: chromosome '{}' (and aliases) not present in {} index",
+                    chrom,
+                    self.metadata.name
+                );
+                return Ok(());
+            }
         };
         if blocks.is_empty() {
             return Ok(());

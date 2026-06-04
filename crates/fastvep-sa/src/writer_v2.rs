@@ -135,16 +135,43 @@ impl Osa2Writer {
             let within_chunk_pos = record.position & chunk_mask;
 
             if var32::is_long(record.ref_allele.len(), record.alt_allele.len()) {
+                // Skip variants whose alleles contain non-ACGT bases. Earlier
+                // revisions silently encoded them as runs of 'T', producing
+                // index entries that could never be retrieved with their
+                // original allele string.
+                let Some(sequence) = kmer16::encode_var(&record.ref_allele, &record.alt_allele)
+                else {
+                    log::warn!(
+                        "Skipping long variant at {}:{} with non-ACGT allele \
+                         (ref={:?} alt={:?})",
+                        chrom,
+                        record.position,
+                        String::from_utf8_lossy(&record.ref_allele),
+                        String::from_utf8_lossy(&record.alt_allele),
+                    );
+                    continue;
+                };
                 long_entries.push((
                     LongVariant {
                         position: record.position,
                         idx: sort_idx as u32,
-                        sequence: kmer16::encode_var(&record.ref_allele, &record.alt_allele),
+                        sequence,
                     },
                     ri,
                 ));
             } else if let Some(key) = var32::encode(within_chunk_pos, &record.ref_allele, &record.alt_allele) {
                 short_entries.push((key, ri));
+            } else {
+                // Short variant that fails Var32 encoding only when it
+                // contains a non-ACGT base; same skip-with-warning policy.
+                log::warn!(
+                    "Skipping short variant at {}:{} with non-ACGT allele \
+                     (ref={:?} alt={:?})",
+                    chrom,
+                    record.position,
+                    String::from_utf8_lossy(&record.ref_allele),
+                    String::from_utf8_lossy(&record.alt_allele),
+                );
             }
         }
 

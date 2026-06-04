@@ -9,9 +9,19 @@ use std::sync::Arc;
 /// Parse a GFF3 file into Transcript models.
 ///
 /// Builds gene -> transcript -> exon/CDS hierarchy from GFF3 features.
+///
+/// Streams lines from `reader` straight into the parser so a multi-GB
+/// Ensembl/GENCODE GFF3 doesn't have to be materialised as `Vec<String>`
+/// before parsing begins. Per-line IO errors are surfaced via the
+/// `Result<String>` iterator with a 1-based line number for diagnostics
+/// (earlier code folded IO errors into empty lines via `unwrap_or_default`,
+/// which silently produced an empty transcript set on truncated files).
 pub fn parse_gff3<R: Read>(reader: R) -> Result<Vec<Transcript>> {
     let buf = BufReader::new(reader);
-    parse_gff3_lines(buf.lines().map(|l| l.unwrap_or_default()))
+    let lines = buf.lines().enumerate().map(|(i, line)| {
+        line.map_err(|e| anyhow::anyhow!("Reading GFF3 line {}: {}", i + 1, e))
+    });
+    parse_gff3_lines(lines)
 }
 
 /// Parse a tabix-indexed GFF3 file, loading only transcripts overlapping given regions.
@@ -105,17 +115,25 @@ pub fn parse_gff3_indexed(
         }
     }
 
-    parse_gff3_lines(all_lines.into_iter())
+    // Lines were already collected into memory by the tabix-chunk loop above,
+    // so wrap them in `Ok` to satisfy the streaming-aware parser signature.
+    parse_gff3_lines(all_lines.into_iter().map(Ok))
 }
 
-/// Core GFF3 parsing logic: takes an iterator of lines and builds Transcript models.
-fn parse_gff3_lines(lines: impl Iterator<Item = String>) -> Result<Vec<Transcript>> {
+/// Core GFF3 parsing logic: takes an iterator of `Result<String>` lines and
+/// builds Transcript models. Each item is either a raw line or a typed IO
+/// error from the underlying reader; the latter aborts parsing immediately
+/// rather than being silently treated as an empty line.
+fn parse_gff3_lines(
+    lines: impl Iterator<Item = Result<String>>,
+) -> Result<Vec<Transcript>> {
     let mut genes: HashMap<String, GffGene> = HashMap::new();
     let mut transcripts: HashMap<String, GffTranscript> = HashMap::new();
     let mut exons: Vec<GffExon> = Vec::new();
     let mut cds_features: Vec<GffCds> = Vec::new();
 
     for line in lines {
+        let line = line?;
         let line = line.trim().to_string();
         let line = line.as_str();
         if line.is_empty() || line.starts_with('#') {
@@ -129,12 +147,23 @@ fn parse_gff3_lines(lines: impl Iterator<Item = String>) -> Result<Vec<Transcrip
 
         let seqid = fields[0];
         let feature_type = fields[2];
-        let start: u64 = fields[3].parse().unwrap_or(0);
-        let end: u64 = fields[4].parse().unwrap_or(0);
+        // Coordinates are required and integral. Earlier these defaulted to 0
+        // on parse failure, silently emitting features at position 0 — which
+        // then collided with everything during overlap queries. Skip the
+        // line with a warning instead so the rest of the file still parses.
+        let Ok(start) = fields[3].parse::<u64>() else {
+            log::warn!("GFF3: skipping line with non-numeric start: {}", fields[3]);
+            continue;
+        };
+        let Ok(end) = fields[4].parse::<u64>() else {
+            log::warn!("GFF3: skipping line with non-numeric end: {}", fields[4]);
+            continue;
+        };
         let strand = match fields[6] {
             "-" => Strand::Reverse,
             _ => Strand::Forward,
         };
+        // Phase is allowed to be "." in GFF3 (no phase); use -1 sentinel.
         let phase: i8 = fields[7].parse().unwrap_or(-1);
         let attrs = parse_attributes(fields[8]);
 
@@ -630,6 +659,10 @@ fn parse_gff3_lines(lines: impl Iterator<Item = String>) -> Result<Vec<Transcrip
         });
     }
 
+    // HashMap iteration order is randomized per process, so sort by stable_id
+    // to make cache serialization bit-for-bit reproducible across builds.
+    result.sort_by(|a, b| a.stable_id.cmp(&b.stable_id));
+
     Ok(result)
 }
 
@@ -836,5 +869,33 @@ chr1\tensembl\texon\t6000\t9000\t.\t-\t.\tID=exon:ENSE00000002;Parent=transcript
         assert_eq!(url_decode("hello%20world"), "hello world");
         assert_eq!(url_decode("100%25"), "100%");
         assert_eq!(url_decode("normal"), "normal");
+    }
+
+    #[test]
+    fn test_gff3_skips_malformed_coordinate_lines() {
+        // Two lines: one valid mRNA, one with a non-numeric start. The malformed
+        // line used to silently parse as start=0, end=0 — colliding with every
+        // overlap query. It should now be skipped (with a logged warning),
+        // leaving the valid line intact.
+        let gff = "##gff-version 3
+chr1\tensembl\tgene\t1000\t5000\t.\t+\t.\tID=gene:G1;Name=T;biotype=protein_coding
+chr1\tensembl\tmRNA\tNOT_A_NUMBER\t5000\t.\t+\t.\tID=transcript:TX1;Parent=gene:G1;biotype=protein_coding
+chr1\tensembl\tmRNA\t1000\t5000\t.\t+\t.\tID=transcript:TX2;Parent=gene:G1;biotype=protein_coding;tag=Ensembl_canonical
+chr1\tensembl\texon\t1000\t1200\t.\t+\t.\tID=exon:E1;Parent=transcript:TX2;rank=1
+chr1\tensembl\tCDS\t1050\t1200\t.\t+\t0\tID=CDS:P1;Parent=transcript:TX2";
+        let transcripts = parse_gff3(gff.as_bytes()).unwrap();
+        // Only TX2 should appear; TX1 had a bogus start and was skipped.
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(&*transcripts[0].stable_id, "TX2");
+        assert_eq!(transcripts[0].start, 1000);
+    }
+
+    #[test]
+    fn test_fasta_rejects_empty_header() {
+        // An empty `>` line would silently make every following base part of an
+        // unnamed sequence that no downstream query can fetch.
+        let bad = ">\nACGT\n";
+        let res = crate::fasta::FastaReader::from_reader(bad.as_bytes());
+        assert!(res.is_err(), "FASTA with empty header should fail to parse");
     }
 }
